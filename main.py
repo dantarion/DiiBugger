@@ -19,7 +19,6 @@ class Message:
     def __init__(self, data):
         self.message, arg1, arg2, arg3 = struct.unpack(">IIII", data)
         self.args = arg1, arg2, arg3
-        print("MESSAGE:", self.message)
 
 
 class EventHolder(QObject):
@@ -510,6 +509,39 @@ class ThreadingTab(QTableWidget):
         self.setLayout(self.layout)
 
 
+class BreakPointList(QListWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.itemDoubleClicked.connect(self.goToDisassembly)
+        events.BreakPointChanged.connect(self.updateList)
+
+    def updateList(self):
+        self.clear()
+        for bp in bugger.breakPoints:
+            self.addItem("0x%08X" %bp)
+
+    def goToDisassembly(self, item):
+        address = bugger.breakPoints[self.row(item)]
+        window.mainWidget.tabWidget.disassemblyTab.disassemblyWidget.setBase(address)
+        window.mainWidget.tabWidget.setCurrentIndex(1)
+
+
+class BreakPointTab(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.list = BreakPointList(self)
+        self.button = QPushButton("Remove", self)
+        self.button.clicked.connect(self.removeBreakPoint)
+        self.layout = QVBoxLayout()
+        self.layout.addWidget(self.list)
+        self.layout.addWidget(self.button)
+        self.setLayout(self.layout)
+
+    def removeBreakPoint(self):
+        if self.list.currentRow() != -1:
+            bugger.toggleBreakPoint(bugger.breakPoints[self.list.currentRow()])
+
+
 class RegisterTab(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
@@ -727,27 +759,29 @@ class DebuggerTabs(QTabWidget):
         self.memoryTab = MemoryTab(self)
         self.disassemblyTab = DisassemblyTab(self)
         self.threadingTab = ThreadingTab(self)
+        self.breakPointTab = BreakPointTab(self)
         self.exceptionTab = ExceptionTab(self)
         self.addTab(self.memoryTab, "Memory")
         self.addTab(self.disassemblyTab, "Disassembly")
         self.addTab(self.threadingTab, "Threads")
+        self.addTab(self.breakPointTab, "Breakpoints")
         self.addTab(self.exceptionTab, "Exceptions")
-        self.setTabEnabled(3, False)
+        self.setTabEnabled(4, False)
 
         events.Exception.connect(self.exceptionOccurred)
         events.Connected.connect(self.connected)
         events.Closed.connect(self.disconnected)
 
     def exceptionOccurred(self, msg):
-        self.setTabEnabled(3, True)
-        self.setCurrentIndex(3) #Exceptions
+        self.setTabEnabled(4, True)
+        self.setCurrentIndex(4) #Exceptions
 
     def connected(self):
         self.setEnabled(True)
 
     def disconnected(self):
         self.setEnabled(False)
-        self.setTabEnabled(3, False)
+        self.setTabEnabled(4, False)
 
 
 class StatusWidget(QWidget):
