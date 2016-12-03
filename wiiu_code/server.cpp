@@ -30,6 +30,13 @@ extern int (* const entryPoint)(int argc, char *argv[]);
     context->srr0 = (u32)handler; \
     return true;
 
+#define CHECK_ERROR(result, funcname) \
+    if (result < 0) { \
+        char buffer[50] = {0}; \
+        GLOBALS->__os_snprintf(buffer, 50, "%s failed: %i", funcname, result); \
+        GLOBALS->OSFatal(buffer); \
+    }
+
 #define CHECK_SOCKET(result, funcname) \
     if (result == -1) { \
         char buffer[50] = {0}; \
@@ -83,6 +90,11 @@ struct globals {
 
     bool connection;
 
+    FSCmdBlock fileBlock;
+    FSClient fileClient;
+
+    char stack[STACK_SIZE];
+
     Declare(OSCreateThread)
     Declare(OSResumeThread)
     Declare(OSGetActiveThreadLink)
@@ -115,6 +127,19 @@ struct globals {
     Declare(ICInvalidateRange)
 
     Declare(MEMAllocFromDefaultHeap)
+    Declare(MEMAllocFromDefaultHeapEx)
+    Declare(MEMFreeToDefaultHeap)
+
+    Declare(FSInit)
+    Declare(FSInitCmdBlock)
+    Declare(FSAddClient)
+    Declare(FSOpenFile)
+    Declare(FSReadFile)
+    Declare(FSCloseFile)
+    Declare(FSGetStatFile)
+    Declare(FSOpenDir)
+    Declare(FSReadDir)
+    Declare(FSCloseDir)
 
     Declare(SOInit)
     Declare(SOSocket)
@@ -129,28 +154,13 @@ struct globals {
     Declare(SOLastError)
 
     Declare(VPADRead)
-
-    char stack[STACK_SIZE];
 };
 
-u8 recvbyte(int fd) {
-	u8 byte;
-	int result = GLOBALS->SORecv(fd, &byte, 1, 0);
-	CHECK_SOCKET(result, "SORecv")
-	return byte;
-}
-
-u32 recvword(int fd) {
-	u32 word;
-	int result = GLOBALS->SORecv(fd, &word, 4, 0);
-	CHECK_SOCKET(result, "SORecv")
-	return word;
-}
-
-void sendall(int fd, void *data, u32 length) {
-	u32 sent = 0;
+void sendall(int fd, void *data, int length) {
+	int sent = 0;
 	while (sent < length) {
-		u32 num = GLOBALS->SOSend(fd, data, length - sent, 0);
+		int num = GLOBALS->SOSend(fd, data, length - sent, 0);
+		CHECK_SOCKET(num, "SOSend")
 		sent += num;
 		data = (char *)data + num;
 	}
@@ -164,6 +174,18 @@ void recvall(int fd, void *buffer, int length) {
         bytes += num;
         buffer = (char *)buffer + num;
     }
+}
+
+u8 recvbyte(int fd) {
+	u8 byte;
+	recvall(fd, &byte, 1);
+	return byte;
+}
+
+u32 recvword(int fd) {
+	u32 word;
+	recvall(fd, &word, 4);
+	return word;
 }
 
 u32 strlen(const char *s) {
@@ -678,6 +700,73 @@ int RPCServer(int intArg, void *ptrArg) {
                     WriteCode(address, TRAP);
                 }
             }
+
+            else if (cmd == 11) { //Read directory
+                char path[640] = {0}; //512 + 128
+                u32 pathlen = recvword(client);
+                if (pathlen < 640) {
+                    recvall(client, &path, pathlen);
+
+                    int error;
+                    int handle;
+                    FSDirEntry entry;
+
+                    error = a->FSOpenDir(&a->fileClient, &a->fileBlock, path, &handle, -1);
+                    CHECK_ERROR(error, "FSOpenDir")
+
+                    while (a->FSReadDir(&a->fileClient, &a->fileBlock, handle, &entry, -1) == 0) {
+                        int namelen = strlen(entry.name);
+                        sendall(client, &namelen, 4);
+                        sendall(client, &entry.stat.flags, 4);
+                        if (!(entry.stat.flags & 0x80000000)) {
+                            sendall(client, &entry.stat.size, 4);
+                        }
+                        sendall(client, &entry.name, namelen);
+                    }
+
+                    error = a->FSCloseDir(&a->fileClient, &a->fileBlock, handle, -1);
+                    CHECK_ERROR(error, "FSCloseDir")
+                }
+                int terminator = 0;
+                sendall(client, &terminator, 4);
+            }
+
+            else if (cmd == 12) { //Dump file
+                char path[640] = {0};
+                u32 pathlen = recvword(client);
+                if (pathlen < 640) {
+                    recvall(client, &path, pathlen);
+
+                    int error, handle;
+                    error = a->FSOpenFile(&a->fileClient, &a->fileBlock, path, "r", &handle, -1);
+                    CHECK_ERROR(error, "FSOpenFile")
+
+                    FSStat stat;
+                    error = a->FSGetStatFile(&a->fileClient, &a->fileBlock, handle, &stat, -1);
+                    CHECK_ERROR(error, "FSGetStatFile")
+
+                    u32 size = stat.size;
+                    char *buffer = (char *)a->MEMAllocFromDefaultHeapEx(size, 0x40);
+
+                    u32 read = 0;
+                    while (read < size) {
+                        int num = a->FSReadFile(&a->fileClient, &a->fileBlock, buffer + read, 1, size - read, handle, 0, -1);
+                        CHECK_ERROR(num, "FSReadFile")
+                        read += num;
+                    }
+
+                    error = a->FSCloseFile(&a->fileClient, &a->fileBlock, handle, -1);
+                    CHECK_ERROR(error, "FSCloseFile")
+
+                    sendall(client, &stat.size, 4);
+                    sendall(client, buffer, stat.size);
+
+                    a->MEMFreeToDefaultHeap(buffer);
+                }
+                else {
+                    a->OSFatal("pathlen >= 640");
+                }
+            }
         }
 
         CHECK_SOCKET(a->SOClose(client), "SOClose")
@@ -774,6 +863,19 @@ int _main(int argc, char *argv[]) {
 	Import(coreinit, ICInvalidateRange)
 
     ImportPtr(coreinit, MEMAllocFromDefaultHeap)
+    ImportPtr(coreinit, MEMAllocFromDefaultHeapEx)
+    ImportPtr(coreinit, MEMFreeToDefaultHeap)
+
+    Import(coreinit, FSInit)
+    Import(coreinit, FSInitCmdBlock)
+    Import(coreinit, FSAddClient)
+    Import(coreinit, FSOpenFile)
+    Import(coreinit, FSReadFile)
+    Import(coreinit, FSCloseFile)
+    Import(coreinit, FSGetStatFile)
+    Import(coreinit, FSOpenDir)
+    Import(coreinit, FSReadDir)
+    Import(coreinit, FSCloseDir)
 	
 	Import2(nsysnet, socket_lib_init, SOInit)
 	Import2(nsysnet, socket, SOSocket)
@@ -792,6 +894,10 @@ int _main(int argc, char *argv[]) {
     a.connection = false;
     a.stepState = STEP_STATE_RUNNING;
     GLOBALS = &a;
+
+    a.FSInit();
+    a.FSInitCmdBlock(&a.fileBlock);
+    a.FSAddClient(&a.fileClient, -1);
 
 	a.OSInitMessageQueue(&a.serverQueue, a.serverMessages, MESSAGE_COUNT);
 	a.OSInitMessageQueue(&a.clientQueue, a.clientMessages, MESSAGE_COUNT);

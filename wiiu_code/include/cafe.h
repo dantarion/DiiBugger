@@ -126,6 +126,8 @@ typedef void  (*DCFlushRange_t)(const void *addr, u32 num);
 typedef void  (*ICInvalidateRange_t)(const void *addr, u32 num);
 
 typedef void *(*MEMAllocFromDefaultHeap_t)(u32 size);
+typedef void *(*MEMAllocFromDefaultHeapEx_t)(u32 size, int alignment);
+typedef void  (*MEMFreeToDefaultHeap_t)(void *ptr);
 typedef void *(*OSAllocFromSystem_t)(u32 size, int alignment);
 typedef void  (*OSFreeToSystem_t)(void *ptr);
 typedef void *(*OSEffectiveToPhysical_t)(void *addr);
@@ -155,6 +157,38 @@ typedef u32   (*OSScreenGetBufferSizeEx_t)(u8 screen);
 typedef void  (*OSScreenInit_t)();
 typedef void  (*OSScreenPutFontEx_t)(u8 screen, u32 x, u32 y, const char *text);
 typedef void  (*OSScreenSetBufferEx_t)(u8 screen, void *ptr);
+
+
+struct FSClient {
+    u8 buffer[5888];
+};
+
+struct FSCmdBlock {
+    u8 buffer[2688];
+};
+
+struct FSStat {
+    u32 flags;
+    u8 _4[0xC];
+    u32 size;
+    u8 _14[0x50];
+};
+
+struct FSDirEntry {
+    FSStat stat;
+    char name[256];
+};
+
+typedef void(*FSInit_t)();
+typedef int (*FSAddClient_t)(FSClient *client, int errHandling);
+typedef void(*FSInitCmdBlock_t)(FSCmdBlock *block);
+typedef int (*FSOpenFile_t)(FSClient *client, FSCmdBlock *block, const char *path, const char *mode, int *handle, int errHandling);
+typedef int (*FSReadFile_t)(FSClient *client, FSCmdBlock *block, void *buffer, u32 size, u32 count, int handle, u32 flags, int errHandling);
+typedef int (*FSCloseFile_t)(FSClient *client, FSCmdBlock *block, int handle, int errHandling);
+typedef int (*FSGetStatFile_t)(FSClient *client, FSCmdBlock *block, int handle, FSStat *stat, int errHandling);
+typedef int (*FSOpenDir_t)(FSClient *client, FSCmdBlock *block, const char *path, int *handle, int errHandling);
+typedef int (*FSReadDir_t)(FSClient *client, FSCmdBlock *block, int handle, FSDirEntry *entry, int errHandling);
+typedef int (*FSCloseDir_t)(FSClient *client, FSCmdBlock *block, int handle, int errHandling);
 
 
 #define AF_INET 2

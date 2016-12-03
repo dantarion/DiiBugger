@@ -2,7 +2,7 @@
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *
-import sys, struct, socket, time
+import sys, struct, socket, time, os
 
 import disassemble
 
@@ -30,6 +30,45 @@ class EventHolder(QObject):
 events = EventHolder()
 
 
+#I don't want to deal with the whole threading trouble to complete big
+#file transfers without the UI becoming unresponsive. There may be a
+#better way to do this, but this is what I came up with.
+class TaskMgr:
+
+    Nothing = 0
+    Running = 1
+    Canceled = 2
+
+    def __init__(self):
+        self.state = self.Nothing
+
+    def init(self):
+        window.mainWidget.tabWidget.setEnabled(False)
+        window.mainWidget.statusWidget.cancelButton.setEnabled(True)
+        window.mainWidget.statusWidget.disconnectButton.setEnabled(False)
+        self.state = self.Running
+
+    def setInfo(self, info, maxvalue):
+        window.mainWidget.statusWidget.progressInfo.setText(info)
+        window.mainWidget.statusWidget.progressBar.setRange(0, maxvalue)
+
+    def update(self, progress):
+        window.mainWidget.statusWidget.progressBar.setValue(progress)
+        app.processEvents()
+
+    def end(self):
+        window.mainWidget.tabWidget.setEnabled(True)
+        window.mainWidget.statusWidget.cancelButton.setEnabled(False)
+        window.mainWidget.statusWidget.disconnectButton.setEnabled(True)
+        window.mainWidget.statusWidget.progressInfo.setText("Connected")
+        window.mainWidget.statusWidget.progressBar.setValue(0)
+        self.state = self.Nothing
+
+    def cancel(self):
+        self.state = self.Canceled
+task = TaskMgr()
+
+
 class Thread:
 
     cores = {
@@ -47,6 +86,16 @@ class Thread:
 
         namelen = struct.unpack_from(">I", data, offs + 20)[0]
         self.name = data[offs + 24 : offs + 24 + namelen].decode("ascii")
+
+
+class DirEntry:
+    def __init__(self, flags, size, name):
+        self.flags = flags
+        self.size = size
+        self.name = name
+
+    def isDir(self):
+        return self.flags & 0x80000000
 
 
 class PyBugger:
@@ -143,6 +192,45 @@ class PyBugger:
         self.sendall(b"\x09")
         data = struct.pack(">32I32d", *exceptionState.gpr, *exceptionState.fpr)
         self.sendall(data)
+
+    def readDirectory(self, path):
+        self.sendall(b"\x0B")
+        self.sendall(struct.pack(">I", len(path)))
+        self.sendall(path.encode("ascii"))
+
+        entries = []
+        namelen = struct.unpack(">I", self.recvall(4))[0]
+        while namelen != 0:
+            flags = struct.unpack(">I", self.recvall(4))[0]
+
+            size = -1
+            if not flags & 0x80000000:
+                size = struct.unpack(">I", self.recvall(4))[0]
+
+            name = self.recvall(namelen).decode("ascii")
+            entries.append(DirEntry(flags, size, name))
+
+            namelen = struct.unpack(">I", self.recvall(4))[0]
+        return entries
+
+    def dumpFile(self, gamePath, outPath):
+        if task.state != task.Running:
+            return
+
+        self.sendall(b"\x0C")
+        self.sendall(struct.pack(">I", len(gamePath)))
+        self.sendall(gamePath.encode("ascii"))
+
+        length = struct.unpack(">I", self.recvall(4))[0]
+        task.setInfo("Dumping %s" %gamePath, length)
+
+        data = b""
+        while len(data) < length:
+            data += self.s.recv(length - len(data))
+            task.update(len(data))
+
+        with open(outPath, "wb") as f:
+            f.write(data)
 
     def sendall(self, data):
         try:
@@ -460,7 +548,7 @@ class DisassemblyInfo(QWidget):
             disassembly.updateText()
 
 
-class DisassemblyTab(QTabWidget):
+class DisassemblyTab(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
         self.disassemblyInfo = DisassemblyInfo(self)
@@ -753,6 +841,104 @@ class ExceptionTab(QTabWidget):
         self.setCurrentIndex(2)  #Stack trace
 
 
+def formatFileSize(size):
+    if size >= 1024 ** 3:
+        return "%.1f GiB" %(size / (1024 ** 3))
+    if size >= 1024 ** 2:
+        return "%.1f MiB" %(size / (1024 ** 2))
+    if size >= 1024:
+        return "%.1f KiB" %(size / 1024)
+    return "%i B" %size
+
+class FileTreeNode(QTreeWidgetItem):
+    def __init__(self, parent, name, size, path):
+        super().__init__(parent)
+        self.name = name
+        self.size = size
+        self.path = path
+
+        self.setText(0, name)
+        if size == -1: #It's a folder
+            self.loaded = False
+        else: #It's a file
+            self.setText(1, formatFileSize(size))
+            self.loaded = True
+
+    def loadChildren(self):
+        if not self.loaded:
+            for i in range(self.childCount()):
+                child = self.child(i)
+                if not child.loaded:
+                    self.child(i).loadContent()
+            self.loaded = True
+
+    def loadContent(self):
+        entries = bugger.readDirectory(self.path)
+        for entry in entries:
+            FileTreeNode(self, entry.name, entry.size, self.path + "/" + entry.name)
+
+    def dump(self, outdir):
+        if task.state != task.Running:
+            return
+
+        outpath = os.path.join(outdir, self.name)
+        if self.size == -1:
+            if os.path.isfile(outpath):
+                os.remove(outpath)
+            if not os.path.exists(outpath):
+                os.mkdir(outpath)
+
+            self.loadChildren()
+            for i in range(self.childCount()):
+                self.child(i).dump(outpath)
+        else:
+            bugger.dumpFile(self.path, outpath)
+
+
+class FileTreeWidget(QTreeWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setHeaderLabels(["Name", "Size"])
+        self.itemExpanded.connect(self.handleItemExpanded)
+        events.Connected.connect(self.initFileTree)
+
+    def initFileTree(self):
+        self.clear()
+        rootItem = FileTreeNode(self, "content", -1, "/vol/content")
+        rootItem.loadContent()
+        self.resizeColumnToContents(0)
+
+    def handleItemExpanded(self, item):
+        item.loadChildren()
+        self.resizeColumnToContents(0)
+
+
+class FileSystemTab(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.fileTree = FileTreeWidget(self)
+        self.dumpButton = QPushButton("Dump", self)
+        self.dumpButton.clicked.connect(self.dump)
+        self.patchButton = QPushButton("Load patch (not implemented yet)", self)
+        self.patchButton.setEnabled(False)
+        self.layout = QVBoxLayout()
+        hlayout = QHBoxLayout()
+        hlayout.addWidget(self.dumpButton)
+        hlayout.addWidget(self.patchButton)
+        self.layout.addWidget(self.fileTree)
+        self.layout.addLayout(hlayout)
+        self.setLayout(self.layout)
+
+    def dump(self):
+        item = self.fileTree.currentItem()
+        if item:
+            outdir = QFileDialog.getExistingDirectory(self, "Dump")
+            if outdir:
+                task.init()
+                item.dump(outdir)
+                task.end()
+
+
 class DebuggerTabs(QTabWidget):
     def __init__(self, parent):
         super().__init__(parent)
@@ -761,11 +947,13 @@ class DebuggerTabs(QTabWidget):
         self.threadingTab = ThreadingTab(self)
         self.breakPointTab = BreakPointTab(self)
         self.exceptionTab = ExceptionTab(self)
+        self.fileSystemTab = FileSystemTab(self)
         self.addTab(self.memoryTab, "Memory")
         self.addTab(self.disassemblyTab, "Disassembly")
         self.addTab(self.threadingTab, "Threads")
         self.addTab(self.breakPointTab, "Breakpoints")
         self.addTab(self.exceptionTab, "Exceptions")
+        self.addTab(self.fileSystemTab, "File System")
         self.setTabEnabled(4, False)
 
         events.Exception.connect(self.exceptionOccurred)
@@ -798,13 +986,17 @@ class StatusWidget(QWidget):
 
         self.progressBar = QProgressBar(self)
         self.progressInfo = QLabel("Disconnected", self)
+        self.cancelButton = QPushButton("Cancel", self)
+        self.cancelButton.clicked.connect(task.cancel)
+        self.cancelButton.setEnabled(False)
 
         self.layout = QGridLayout()
         self.layout.addWidget(self.serverLabel, 0, 0)
         self.layout.addWidget(self.serverBox, 1, 0)
         self.layout.addWidget(self.connectButton, 0, 1)
         self.layout.addWidget(self.disconnectButton, 1, 1)
-        self.layout.addWidget(self.progressBar, 2, 0, 1, 2)
+        self.layout.addWidget(self.progressBar, 2, 0)
+        self.layout.addWidget(self.cancelButton, 2, 1)
         self.layout.addWidget(self.progressInfo, 3, 0, 1, 2)
         self.setLayout(self.layout)
 
@@ -854,8 +1046,14 @@ class MainWindow(QMainWindow):
         self.timer.start()
 
     def updateBugger(self):
-        if bugger.connected:
+        if bugger.connected and task.state == task.Nothing:
             bugger.updateMessages()
+
+    def closeEvent(self, e):
+        if task.state != task.Nothing:
+            e.ignore()
+        else:
+            e.accept()
 
 
 exceptionState = ExceptionState()
