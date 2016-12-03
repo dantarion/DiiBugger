@@ -746,20 +746,21 @@ int RPCServer(int intArg, void *ptrArg) {
                     CHECK_ERROR(error, "FSGetStatFile")
 
                     u32 size = stat.size;
-                    char *buffer = (char *)a->MEMAllocFromDefaultHeapEx(size, 0x40);
+                    sendall(client, &stat.size, 4);
+
+                    char *buffer = (char *)a->MEMAllocFromDefaultHeapEx(0x20000, 0x40);
 
                     u32 read = 0;
                     while (read < size) {
-                        int num = a->FSReadFile(&a->fileClient, &a->fileBlock, buffer + read, 1, size - read, handle, 0, -1);
+                        int num = a->FSReadFile(&a->fileClient, &a->fileBlock, buffer, 1, 0x20000, handle, 0, -1);
                         CHECK_ERROR(num, "FSReadFile")
                         read += num;
+
+                        sendall(client, buffer, num);
                     }
 
                     error = a->FSCloseFile(&a->fileClient, &a->fileBlock, handle, -1);
                     CHECK_ERROR(error, "FSCloseFile")
-
-                    sendall(client, &stat.size, 4);
-                    sendall(client, buffer, stat.size);
 
                     a->MEMFreeToDefaultHeap(buffer);
                 }
