@@ -95,6 +95,8 @@ struct globals {
 
     char stack[STACK_SIZE];
 
+    Declare(OSDynLoad_GetModuleName)
+
     Declare(OSCreateThread)
     Declare(OSResumeThread)
     Declare(OSGetActiveThreadLink)
@@ -768,6 +770,16 @@ int RPCServer(int intArg, void *ptrArg) {
                     a->OSFatal("pathlen >= 640");
                 }
             }
+
+            else if (cmd == 13) {
+                char name[100] = {0};
+                int length = 100;
+                a->OSDynLoad_GetModuleName(-1, name, &length);
+
+                length = strlen(name);
+                sendall(client, &length, 4);
+                sendall(client, name, length);
+            }
         }
 
         CHECK_SOCKET(a->SOClose(client), "SOClose")
@@ -832,6 +844,8 @@ int _main(int argc, char *argv[]) {
 	Acquire(coreinit)
 	Acquire(nsysnet)
 	Acquire(vpad)
+
+	Import(coreinit, OSDynLoad_GetModuleName)
 
 	Import(coreinit, OSCreateThread)
 	Import(coreinit, OSResumeThread)

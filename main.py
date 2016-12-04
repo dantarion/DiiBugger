@@ -232,6 +232,11 @@ class PyBugger:
         with open(outPath, "wb") as f:
             f.write(data)
 
+    def getModuleName(self):
+        self.sendall(b"\x0D")
+        length = struct.unpack(">I", self.recvall(4))[0]
+        return self.recvall(length).decode("ascii") + ".rpx"
+
     def sendall(self, data):
         try:
             self.s.sendall(data)
@@ -1037,13 +1042,23 @@ class MainWindow(QMainWindow):
         self.mainWidget = MainWidget(self)
         self.setCentralWidget(self.mainWidget)
 
-        self.setWindowTitle("Wii U Debugger")
+        self.setWindowTitle("DiiBugger")
         self.resize(1080, 720)
 
         self.timer = QTimer(self)
         self.timer.setInterval(100)
         self.timer.timeout.connect(self.updateBugger)
         self.timer.start()
+
+        events.Connected.connect(self.updateTitle)
+        events.Closed.connect(self.updateTitle)
+
+    def updateTitle(self):
+        if bugger.connected:
+            name = bugger.getModuleName()
+            self.setWindowTitle("DiiBugger - %s" %name)
+        else:
+            self.setWindowTitle("DiiBugger")
 
     def updateBugger(self):
         if bugger.connected and task.state == task.Nothing:

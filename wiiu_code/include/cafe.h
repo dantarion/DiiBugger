@@ -118,6 +118,8 @@ struct OSThread {
 
 typedef bool (*OSExceptionCallback)(OSContext *context);
 
+typedef int (*OSDynLoad_GetModuleName_t)(int handle, char *name, int *size);
+
 typedef void  (*OSFatal_t)(const char *msg);
 typedef int   (*__os_snprintf_t)(char *buffer, int size, char *fmt, ... );
 typedef void  (*_Exit_t)();
