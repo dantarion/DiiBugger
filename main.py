@@ -11,18 +11,25 @@ class Message:
     DSI = 0
     ISI = 1
     Program = 2
+    GetStat = 3
+    OpenFile = 4
+    ReadFile = 5
+    CloseFile = 6
+    SetPosFile = 7
+    GetStatFile = 8
 
     Continue = 0
     Step = 1
     StepOver = 2
 
-    def __init__(self, data):
-        self.message, arg1, arg2, arg3 = struct.unpack(">IIII", data)
-        self.args = arg1, arg2, arg3
+    def __init__(self, type, data, arg):
+        self.type = type
+        self.data = data
+        self.arg = arg
 
 
 class EventHolder(QObject):
-    Exception = pyqtSignal(Message)
+    Exception = pyqtSignal()
     Connected = pyqtSignal()
     Closed = pyqtSignal()
     BreakPointChanged = pyqtSignal()
@@ -31,42 +38,69 @@ events = EventHolder()
 
 
 #I don't want to deal with the whole threading trouble to complete big
-#file transfers without the UI becoming unresponsive. There may be a
-#better way to do this, but this is what I came up with.
+#file transfers without the UI becoming unresponsive. There probably is
+#a better way to code this, but this is what I came up with.
 class TaskMgr:
-
-    Nothing = 0
-    Running = 1
-    Canceled = 2
-
     def __init__(self):
-        self.state = self.Nothing
+        self.taskQueue = []
 
-    def init(self):
-        window.mainWidget.tabWidget.setEnabled(False)
-        window.mainWidget.statusWidget.cancelButton.setEnabled(True)
-        window.mainWidget.statusWidget.disconnectButton.setEnabled(False)
-        self.state = self.Running
+    def add(self, task):
+        if not self.taskQueue:
+            window.mainWidget.statusWidget.disconnectButton.setEnabled(False)
+        self.taskQueue.append(task)
 
-    def setInfo(self, info, maxvalue):
+    def pop(self, task):
+        assert task == self.taskQueue.pop()
+
+        if not self.taskQueue:
+            window.mainWidget.tabWidget.setEnabled(True)
+            window.mainWidget.statusWidget.cancelButton.setEnabled(False)
+            window.mainWidget.statusWidget.disconnectButton.setEnabled(True)
+            window.mainWidget.statusWidget.progressBar.setValue(0)
+            window.mainWidget.statusWidget.progressInfo.setText("Connected")
+        else:
+            self.taskQueue[-1].resume()
+
+    def isBlocking(self):
+        if not self.taskQueue:
+            return False
+        return self.taskQueue[-1].blocking
+
+    def cancel(self):
+        self.taskQueue[-1].canceled = True
+taskMgr = TaskMgr()
+
+
+class Task:
+    def __init__(self, blocking, cancelable):
+        taskMgr.add(self)
+
+        self.canceled = False
+        self.blocking = blocking
+        self.cancelable = cancelable
+        window.mainWidget.tabWidget.setEnabled(not blocking)
+        window.mainWidget.statusWidget.cancelButton.setEnabled(cancelable)
+
+    def setInfo(self, info, maxValue):
+        self.info = info
+        self.maxValue = maxValue
         window.mainWidget.statusWidget.progressInfo.setText(info)
-        window.mainWidget.statusWidget.progressBar.setRange(0, maxvalue)
+        window.mainWidget.statusWidget.progressBar.setRange(0, maxValue)
 
     def update(self, progress):
+        self.progress = progress
         window.mainWidget.statusWidget.progressBar.setValue(progress)
         app.processEvents()
 
-    def end(self):
-        window.mainWidget.tabWidget.setEnabled(True)
-        window.mainWidget.statusWidget.cancelButton.setEnabled(False)
-        window.mainWidget.statusWidget.disconnectButton.setEnabled(True)
-        window.mainWidget.statusWidget.progressInfo.setText("Connected")
-        window.mainWidget.statusWidget.progressBar.setValue(0)
-        self.state = self.Nothing
+    def resume(self):
+        window.mainWidget.tabWidget.setEnabled(not self.blocking)
+        window.mainWidget.statusWidget.cancelButton.setEnabled(self.cancelable)
+        window.mainWidget.statusWidget.progressInfo.setText(self.info)
+        window.mainWidget.statusWidget.progressBar.setRange(0, self.maxValue)
+        window.mainWidget.statusWidget.progressBar.setValue(self.progress)
 
-    def cancel(self):
-        self.state = self.Canceled
-task = TaskMgr()
+    def end(self):
+        taskMgr.pop(self)
 
 
 class Thread:
@@ -104,11 +138,81 @@ class PyBugger:
         self.connected = False
         self.breakPoints = []
 
+        self.basePath = b""
+        self.currentHandle = 0x12345678
+        self.files = {}
+
         self.messageHandlers = {
-            Message.DSI: events.Exception.emit,
-            Message.ISI: events.Exception.emit,
-            Message.Program: events.Exception.emit,
+            Message.DSI: self.handleException,
+            Message.ISI: self.handleException,
+            Message.Program: self.handleException,
+            Message.GetStat: self.handleGetStat,
+            Message.OpenFile: self.handleOpenFile,
+            Message.ReadFile: self.handleReadFile,
+            Message.CloseFile: self.handleCloseFile,
+            Message.SetPosFile: self.handleSetPosFile,
+            Message.GetStatFile: self.handleGetStatFile
         }
+
+    def handleException(self, msg):
+        exceptionState.load(msg.data, msg.type)
+        events.Exception.emit()
+
+    def handleGetStat(self, msg):
+        gamePath = msg.data.decode("ascii")
+        path = os.path.join(self.basePath, gamePath.strip("/vol"))
+        print("GetStat: %s" %gamePath)
+        self.sendFileMessage(os.path.getsize(path))
+
+    def handleOpenFile(self, msg):
+        mode = struct.pack(">I", msg.arg).decode("ascii").strip("\x00") + "b"
+        path = msg.data.decode("ascii")
+        print("Open: %s" %path)
+
+        f = open(os.path.join(self.basePath, path.strip("/vol")), mode)
+        self.files[self.currentHandle] = f
+        self.sendFileMessage(self.currentHandle)
+        self.currentHandle += 1
+
+    def handleReadFile(self, msg):
+        print("Read")
+        task = Task(blocking=False, cancelable=False)
+        bufferAddr, size, count, handle = struct.unpack(">IIII", msg.data)
+
+        data = self.files[handle].read(size * count)
+        task.setInfo("Sending file", len(data))
+
+        bytesSent = 0
+        while bytesSent < len(data):
+            length = min(len(data) - bytesSent, 0x8000)
+            self.sendall(b"\x03")
+            self.sendall(struct.pack(">II", bufferAddr, length))
+            self.sendall(data[bytesSent : bytesSent + length])
+            bufferAddr += length
+            bytesSent += length
+            task.update(bytesSent)
+        self.sendFileMessage(bytesSent // size)
+        task.end()
+
+    def handleCloseFile(self, msg):
+        print("Close")
+        self.files.pop(msg.arg).close()
+        self.sendFileMessage()
+
+    def handleSetPosFile(self, msg):
+        print("SetPos")
+        handle, pos = struct.unpack(">II", msg.data)
+        self.files[handle].seek(pos)
+        self.sendFileMessage()
+
+    def handleGetStatFile(self, msg):
+        print("GetStatFile")
+        f = self.files[msg.arg]
+        pos = f.tell()
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(pos)
+        self.sendFileMessage(size)
 
     def connect(self, host):
         self.s = socket.socket()
@@ -128,8 +232,11 @@ class PyBugger:
         self.sendall(b"\x07")
         count = struct.unpack(">I", self.recvall(4))[0]
         for i in range(count):
-            message = Message(self.recvall(16))
-            self.messageHandlers[message.message](message)
+            type, ptr, length, arg = struct.unpack(">IIII", self.recvall(16))
+            data = None
+            if length:
+                data = self.recvall(length)
+            self.messageHandlers[type](Message(type, data, arg))
 
     def read(self, addr, num):
         self.sendall(b"\x02")
@@ -182,6 +289,10 @@ class PyBugger:
         self.sendall(b"\x06")
         self.sendall(struct.pack(">IIII", message, data0, data1, data2))
 
+    def sendFileMessage(self, data0=0, data1=0, data2=0):
+        self.sendall(b"\x0F")
+        self.sendall(struct.pack(">IIII", 0, data0, data1, data2))
+
     def getStackTrace(self):
         self.sendall(b"\x08")
         count = struct.unpack(">I", self.recvall(4))[0]
@@ -213,8 +324,8 @@ class PyBugger:
             namelen = struct.unpack(">I", self.recvall(4))[0]
         return entries
 
-    def dumpFile(self, gamePath, outPath):
-        if task.state != task.Running:
+    def dumpFile(self, gamePath, outPath, task):
+        if task.canceled:
             return
 
         self.sendall(b"\x0C")
@@ -224,18 +335,33 @@ class PyBugger:
         length = struct.unpack(">I", self.recvall(4))[0]
         task.setInfo("Dumping %s" %gamePath, length)
 
-        data = b""
-        while len(data) < length:
-            data += self.s.recv(length - len(data))
-            task.update(len(data))
-
         with open(outPath, "wb") as f:
-            f.write(data)
+            bytesDumped = 0
+            while bytesDumped < length:
+                data = self.s.recv(length - bytesDumped)
+                f.write(data)
+                bytesDumped += len(data)
+                task.update(bytesDumped)
 
     def getModuleName(self):
         self.sendall(b"\x0D")
         length = struct.unpack(">I", self.recvall(4))[0]
         return self.recvall(length).decode("ascii") + ".rpx"
+
+    def setPatchFiles(self, fileList, basePath):
+        self.basePath = basePath
+        self.sendall(b"\x0E")
+
+        fileBuffer = struct.pack(">I", len(fileList))
+        for path in fileList:
+            fileBuffer += struct.pack(">H", len(path))
+            fileBuffer += path.encode("ascii")
+
+        self.sendall(struct.pack(">I", len(fileBuffer)))
+        self.sendall(fileBuffer)
+
+    def clearPatchFiles(self):
+        self.sendall(b"\x10")
 
     def sendall(self, data):
         try:
@@ -297,10 +423,7 @@ class ExceptionState:
 
     exceptionNames = ["DSI", "ISI", "Program"]
 
-    def load(self, msg):
-        addr = msg.args[0]
-        context = bugger.read(addr, 0x320)
-
+    def load(self, context, type):
         #Convert tuple to list to make it mutable
         self.gpr = list(struct.unpack_from(">32I", context, 8))
         self.cr, self.lr, self.ctr, self.xer = struct.unpack_from(">4I", context, 0x88)
@@ -309,7 +432,7 @@ class ExceptionState:
         self.gqr = list(struct.unpack_from(">8I", context, 0x1BC))
         self.psf = list(struct.unpack_from(">32d", context, 0x1E0))
 
-        self.exceptionName = self.exceptionNames[msg.message]
+        self.exceptionName = self.exceptionNames[type]
 
     def isBreakPoint(self):
         return self.exceptionName == "Program" and self.srr1 & 0x20000
@@ -456,6 +579,11 @@ class DisassemblyWidget(QTextEdit):
         self.setBase(0)
 
         events.BreakPointChanged.connect(self.updateHighlight)
+        events.Continue.connect(self.handleContinue)
+
+    def handleContinue(self):
+        self.currentInstruction = None
+        self.updateHighlight()
 
     def setCurrentInstruction(self, instr):
         self.currentInstruction = instr
@@ -678,7 +806,7 @@ class RegisterTab(QWidget):
         self.pokeButton.setEnabled(enabled)
         self.resetButton.setEnabled(enabled)
 
-    def exceptionOccurred(self, msg):
+    def exceptionOccurred(self):
         self.updateRegisters()
         self.setEditEnabled(exceptionState.isBreakPoint())
 
@@ -704,7 +832,7 @@ class ExceptionInfo(QGroupBox):
 
         events.Exception.connect(self.updateInfo)
 
-    def updateInfo(self, msg):
+    def updateInfo(self):
         self.typeLabel.setText("Type: %s" %exceptionState.exceptionName)
 
 
@@ -741,7 +869,7 @@ class SpecialRegisters(QGroupBox):
 
         events.Exception.connect(self.updateRegisters)
 
-    def updateRegisters(self, msg):
+    def updateRegisters(self):
         self.cr.setText("%X" %exceptionState.cr)
         self.lr.setText("%X" %exceptionState.lr)
         self.ctr.setText("%X" %exceptionState.ctr)
@@ -768,7 +896,7 @@ class StackTrace(QListWidget):
         super().__init__(parent)
         events.Exception.connect(self.updateTrace)
 
-    def updateTrace(self, msg):
+    def updateTrace(self):
         self.clear()
         stackTrace = bugger.getStackTrace()
         for address in (exceptionState.srr0, exceptionState.lr) + stackTrace:
@@ -797,7 +925,7 @@ class BreakPointActions(QWidget):
     def disableButtons(self):
         self.setButtonsEnabled(False)
 
-    def updateButtons(self, msg):
+    def updateButtons(self):
         self.setButtonsEnabled(exceptionState.isBreakPoint())
 
     def setButtonsEnabled(self, enabled):
@@ -823,7 +951,7 @@ class StackTraceTab(QWidget):
         self.stackTrace.itemDoubleClicked.connect(self.jumpDisassembly)
         events.Exception.connect(self.exceptionOccurred)
 
-    def exceptionOccurred(self, msg):
+    def exceptionOccurred(self):
         self.disassembly.setCurrentInstruction(exceptionState.srr0)
 
     def jumpDisassembly(self, item):
@@ -842,7 +970,7 @@ class ExceptionTab(QTabWidget):
 
         events.Exception.connect(self.exceptionOccurred)
 
-    def exceptionOccurred(self, msg):
+    def exceptionOccurred(self):
         self.setCurrentIndex(2)  #Stack trace
 
 
@@ -882,8 +1010,8 @@ class FileTreeNode(QTreeWidgetItem):
         for entry in entries:
             FileTreeNode(self, entry.name, entry.size, self.path + "/" + entry.name)
 
-    def dump(self, outdir):
-        if task.state != task.Running:
+    def dump(self, outdir, task):
+        if task.canceled:
             return
 
         outpath = os.path.join(outdir, self.name)
@@ -895,9 +1023,9 @@ class FileTreeNode(QTreeWidgetItem):
 
             self.loadChildren()
             for i in range(self.childCount()):
-                self.child(i).dump(outpath)
+                self.child(i).dump(outpath, task)
         else:
-            bugger.dumpFile(self.path, outpath)
+            bugger.dumpFile(self.path, outpath, task)
 
 
 class FileTreeWidget(QTreeWidget):
@@ -924,12 +1052,17 @@ class FileSystemTab(QWidget):
         self.fileTree = FileTreeWidget(self)
         self.dumpButton = QPushButton("Dump", self)
         self.dumpButton.clicked.connect(self.dump)
-        self.patchButton = QPushButton("Load patch (not implemented yet)", self)
-        self.patchButton.setEnabled(False)
+        self.patchButton = QPushButton("Load patch", self)
+        self.patchButton.clicked.connect(self.loadPatch)
+        self.clearButton = QPushButton("Clear patch", self)
+        self.clearButton.clicked.connect(self.clearPatch)
+        self.clearButton.setEnabled(False)
+
         self.layout = QVBoxLayout()
         hlayout = QHBoxLayout()
         hlayout.addWidget(self.dumpButton)
         hlayout.addWidget(self.patchButton)
+        hlayout.addWidget(self.clearButton)
         self.layout.addWidget(self.fileTree)
         self.layout.addLayout(hlayout)
         self.setLayout(self.layout)
@@ -939,9 +1072,26 @@ class FileSystemTab(QWidget):
         if item:
             outdir = QFileDialog.getExistingDirectory(self, "Dump")
             if outdir:
-                task.init()
-                item.dump(outdir)
+                task = Task(blocking=True, cancelable=True)
+                item.dump(outdir, task)
                 task.end()
+
+    def loadPatch(self):
+        patchDir = QFileDialog.getExistingDirectory(self, "Load patch")
+        if patchDir:
+            baseLength = len(patchDir)
+            fileList = []
+            for dirname, subdirs, files in os.walk(patchDir):
+                for filename in files:
+                    gamePath = "/vol" + dirname[baseLength:].replace("\\", "/") + "/" + filename
+                    fileList.append(gamePath)
+
+            bugger.setPatchFiles(fileList, patchDir)
+            self.clearButton.setEnabled(True)
+
+    def clearPatch(self):
+        bugger.clearPatchFiles()
+        self.clearButton.setEnabled(False)
 
 
 class DebuggerTabs(QTabWidget):
@@ -965,7 +1115,7 @@ class DebuggerTabs(QTabWidget):
         events.Connected.connect(self.connected)
         events.Closed.connect(self.disconnected)
 
-    def exceptionOccurred(self, msg):
+    def exceptionOccurred(self):
         self.setTabEnabled(4, True)
         self.setCurrentIndex(4) #Exceptions
 
@@ -992,7 +1142,7 @@ class StatusWidget(QWidget):
         self.progressBar = QProgressBar(self)
         self.progressInfo = QLabel("Disconnected", self)
         self.cancelButton = QPushButton("Cancel", self)
-        self.cancelButton.clicked.connect(task.cancel)
+        self.cancelButton.clicked.connect(taskMgr.cancel)
         self.cancelButton.setEnabled(False)
 
         self.layout = QGridLayout()
@@ -1061,19 +1211,17 @@ class MainWindow(QMainWindow):
             self.setWindowTitle("DiiBugger")
 
     def updateBugger(self):
-        if bugger.connected and task.state == task.Nothing:
+        if bugger.connected and not taskMgr.isBlocking():
             bugger.updateMessages()
 
     def closeEvent(self, e):
-        if task.state != task.Nothing:
+        if taskMgr.taskQueue:
             e.ignore()
         else:
             e.accept()
 
 
 exceptionState = ExceptionState()
-events.Exception.connect(exceptionState.load)
-
 bugger = PyBugger()
 app = QApplication(sys.argv)
 app.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))

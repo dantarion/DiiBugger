@@ -5,6 +5,13 @@
 #define INSTALL_ADDR 0x011DD000
 #define MAIN_JMP_ADDR 0x0101C56C
 
+#define FSGetStat 0x01070810
+#define FSOpenFile 0x0106F9C4
+#define FSCloseFile 0x0106FAD0
+#define FSReadFile 0x0106FB50
+#define FSSetPosFile 0x0106FF78
+#define FSGetStatFile 0x0106FFE8
+
 #define KERN_ADDRESS_TBL 0xFFEAB7A0
 
 #define Acquire(module) \
@@ -99,6 +106,12 @@ void _main() {
         ICInvalidateRange((void *)codeAddr, code_length);
 
         insertBranchL(MAIN_JMP_ADDR, INSTALL_ADDR, DCFlushRange, ICInvalidateRange);
+        insertBranch(FSGetStat + 0x24, INSTALL_ADDR + 4, DCFlushRange, ICInvalidateRange);
+        insertBranch(FSOpenFile + 0x28, INSTALL_ADDR + 8, DCFlushRange, ICInvalidateRange);
+        insertBranch(FSReadFile + 0x30, INSTALL_ADDR + 12, DCFlushRange, ICInvalidateRange);
+        insertBranch(FSCloseFile + 0x2C, INSTALL_ADDR + 16, DCFlushRange, ICInvalidateRange);
+        insertBranch(FSSetPosFile + 0x24, INSTALL_ADDR + 20, DCFlushRange, ICInvalidateRange);
+        insertBranch(FSGetStatFile + 0x24, INSTALL_ADDR + 24, DCFlushRange, ICInvalidateRange);
 
         //Disable OSSetExceptionCallback because DKC: TF will
         //overwrite our own exception handlers otherwise
@@ -111,9 +124,6 @@ void _main() {
 
         kern_write(KERN_ADDRESS_TBL + 0x48, 0x80000000);
         kern_write(KERN_ADDRESS_TBL + 0x4C, 0x28305800);
-
-        //Clear globals pointer
-        *(u32 *)0x10000000 = 0;
     }
     _Exit();
 }

@@ -184,9 +184,11 @@ struct FSDirEntry {
 typedef void(*FSInit_t)();
 typedef int (*FSAddClient_t)(FSClient *client, int errHandling);
 typedef void(*FSInitCmdBlock_t)(FSCmdBlock *block);
+typedef int (*FSGetStat_t)(FSClient *client, FSCmdBlock *block, const char *path, FSStat *stat, int errHandling);
 typedef int (*FSOpenFile_t)(FSClient *client, FSCmdBlock *block, const char *path, const char *mode, int *handle, int errHandling);
 typedef int (*FSReadFile_t)(FSClient *client, FSCmdBlock *block, void *buffer, u32 size, u32 count, int handle, u32 flags, int errHandling);
 typedef int (*FSCloseFile_t)(FSClient *client, FSCmdBlock *block, int handle, int errHandling);
+typedef int (*FSSetPosFile_t)(FSClient *client, FSCmdBlock *block, int handle, u32 pos, int errHandling);
 typedef int (*FSGetStatFile_t)(FSClient *client, FSCmdBlock *block, int handle, FSStat *stat, int errHandling);
 typedef int (*FSOpenDir_t)(FSClient *client, FSCmdBlock *block, const char *path, int *handle, int errHandling);
 typedef int (*FSReadDir_t)(FSClient *client, FSCmdBlock *block, int handle, FSDirEntry *entry, int errHandling);

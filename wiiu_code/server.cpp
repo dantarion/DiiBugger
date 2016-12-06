@@ -44,6 +44,12 @@ extern int (* const entryPoint)(int argc, char *argv[]);
         GLOBALS->OSFatal(buffer); \
     }
 
+//Address 0x10000000 contains the word 1000 by default (coreinit.rpl)
+#define INIT_FS_PATCH \
+    globals *a = GLOBALS; \
+    if (a == (globals *)1000) return -1; \
+    if (client == &a->fileClient) return -1;
+
 #define STACK_SIZE 0x8000
 #define MESSAGE_COUNT 4
 #define GLOBALS (*(globals **)0x10000000)
@@ -54,6 +60,12 @@ extern int (* const entryPoint)(int argc, char *argv[]);
 #define SERVER_MESSAGE_DSI 0
 #define SERVER_MESSAGE_ISI 1
 #define SERVER_MESSAGE_PROGRAM 2
+#define SERVER_MESSAGE_GET_STAT 3
+#define SERVER_MESSAGE_OPEN_FILE 4
+#define SERVER_MESSAGE_READ_FILE 5
+#define SERVER_MESSAGE_CLOSE_FILE 6
+#define SERVER_MESSAGE_SET_POS_FILE 7
+#define SERVER_MESSAGE_GET_STAT_FILE 8
 
 #define CLIENT_MESSAGE_CONTINUE 0
 #define CLIENT_MESSAGE_STEP 1
@@ -76,8 +88,10 @@ struct globals {
     OSThread thread;
     OSMessageQueue serverQueue;
     OSMessageQueue clientQueue;
+    OSMessageQueue fileQueue;
     OSMessage serverMessages[MESSAGE_COUNT];
     OSMessage clientMessages[MESSAGE_COUNT];
+    OSMessage fileMessage;
     OSContext crashContext;
     u32 crashType;
 
@@ -92,6 +106,8 @@ struct globals {
 
     FSCmdBlock fileBlock;
     FSClient fileClient;
+    char *patchFiles;
+    int fileHandle;
 
     char stack[STACK_SIZE];
 
@@ -218,6 +234,128 @@ void WriteCode(u32 address, u32 instr) {
     GLOBALS->ICInvalidateRange(ptr, 4);
 }
 
+bool compare(const char *one, const char *two, int length) {
+    for (int i = 0; i < length; i++) {
+        if (one[i] != two[i]) return false;
+    }
+    return true;
+}
+
+bool IsServerFile(const char *path) {
+    const char *fileList = GLOBALS->patchFiles;
+    if (fileList) {
+        u32 fileCount = *(u32 *)fileList; fileList += 4;
+        for (u32 i = 0; i < fileCount; i++) {
+            u16 pathLength = *(u16 *)fileList; fileList += 2;
+            if (strlen(path) == pathLength) {
+                if (compare(fileList, path, pathLength)) {
+                    return true;
+                }
+            }
+            fileList += pathLength;
+        }
+    }
+    return false;
+}
+
+extern "C" {
+
+    int Patch_FSGetStat(FSClient *client, FSCmdBlock *block, const char *path, FSStat *stat, int errHandling) {
+        INIT_FS_PATCH
+        if (!IsServerFile(path)) return -1;
+
+        OSMessage message;
+        message.message = SERVER_MESSAGE_GET_STAT;
+        message.data0 = (u32)path;
+        message.data1 = strlen(path);
+        a->OSSendMessage(&a->serverQueue, &message, OS_MESSAGE_BLOCK);
+        a->OSReceiveMessage(&a->fileQueue, &message, OS_MESSAGE_BLOCK);
+        memset((char *)stat, 0, sizeof(FSStat));
+        stat->size = message.data0;
+        return 0;
+    }
+
+    int Patch_FSOpenFile(FSClient *client, FSCmdBlock *block, const char *path, const char *mode, int *handle, int errHandling) {
+        INIT_FS_PATCH
+        if (!IsServerFile(path)) return -1;
+        if (a->fileHandle != 0) {
+            a->OSFatal("The game tried to open two patched files at the same time.\n"
+                       "However, the current debugger implementation only allows\n"
+                       "one patched file to be opened at once.");
+        }
+
+        OSMessage message;
+        message.message = SERVER_MESSAGE_OPEN_FILE;
+        message.data0 = (u32)path;
+        message.data1 = strlen(path);
+        message.data2 = *(u32 *)mode; //A bit of a hack
+        a->OSSendMessage(&a->serverQueue, &message, OS_MESSAGE_BLOCK);
+        a->OSReceiveMessage(&a->fileQueue, &message, OS_MESSAGE_BLOCK);
+        *handle = message.data0;
+        a->fileHandle = message.data0;
+        return 0;
+    }
+
+    int Patch_FSReadFile(FSClient *client, FSCmdBlock *block, void *buffer, u32 size, u32 count, int handle, u32 flags, int errHandling) {
+        INIT_FS_PATCH
+        if (handle != a->fileHandle) return -1;
+
+        u32 readArgs[] = {(u32)buffer, size, count, handle};
+        OSMessage message;
+        message.message = SERVER_MESSAGE_READ_FILE;
+        message.data0 = (u32)readArgs;
+        message.data1 = 0x10;
+        a->OSSendMessage(&a->serverQueue, &message, OS_MESSAGE_BLOCK);
+        a->OSReceiveMessage(&a->fileQueue, &message, OS_MESSAGE_BLOCK);
+        return message.data0;
+    }
+
+    int Patch_FSCloseFile(FSClient *client, FSCmdBlock *block, int handle, int errHandling) {
+        INIT_FS_PATCH
+        if (handle != a->fileHandle) return -1;
+
+        OSMessage message;
+        message.message = SERVER_MESSAGE_CLOSE_FILE;
+        message.data0 = 0;
+        message.data1 = 0;
+        message.data2 = handle;
+        a->OSSendMessage(&a->serverQueue, &message, OS_MESSAGE_BLOCK);
+        a->OSReceiveMessage(&a->fileQueue, &message, OS_MESSAGE_BLOCK);
+        a->fileHandle = 0;
+        return 0;
+    }
+
+    int Patch_FSSetPosFile(FSClient *client, FSCmdBlock *block, int handle, u32 pos, int errHandling) {
+        INIT_FS_PATCH
+        if (handle != a->fileHandle) return -1;
+
+        u32 args[] = {handle, pos};
+        OSMessage message;
+        message.message = SERVER_MESSAGE_SET_POS_FILE;
+        message.data0 = 8;
+        message.data1 = (u32)args;
+        a->OSSendMessage(&a->serverQueue, &message, OS_MESSAGE_BLOCK);
+        a->OSReceiveMessage(&a->fileQueue, &message, OS_MESSAGE_BLOCK);
+        return 0;
+    }
+
+    int Patch_FSGetStatFile(FSClient *client, FSCmdBlock *block, int handle, FSStat *stat, int errHandling) {
+        INIT_FS_PATCH
+        if (handle != a->fileHandle) return -1;
+
+        OSMessage message;
+        message.message = SERVER_MESSAGE_GET_STAT_FILE;
+        message.data0 = 0;
+        message.data1 = 0;
+        message.data2 = handle;
+        a->OSSendMessage(&a->serverQueue, &message, OS_MESSAGE_BLOCK);
+        a->OSReceiveMessage(&a->fileQueue, &message, OS_MESSAGE_BLOCK);
+        stat->size = message.data0;
+        return 0;
+    }
+
+}
+
 void FatalCrashHandler() {
     globals *a = GLOBALS;
 
@@ -290,6 +428,7 @@ void ReportCrash(u32 msg) {
     OSMessage message;
     message.message = msg;
     message.data0 = (u32)&a->crashContext;
+    message.data1 = sizeof(a->crashContext);
     a->OSSendMessage(&a->serverQueue, &message, OS_MESSAGE_BLOCK);
     while (true) {
         a->OSSleepTicks(1000000);
@@ -418,6 +557,7 @@ void HandleProgram() {
         OSMessage message;
         message.message = SERVER_MESSAGE_PROGRAM;
         message.data0 = (u32)&a->crashContext;
+        message.data1 = sizeof(a->crashContext);
         a->OSSendMessage(&a->serverQueue, &message, OS_MESSAGE_BLOCK);
 
         a->OSReceiveMessage(&a->clientQueue, &message, OS_MESSAGE_BLOCK);
@@ -564,6 +704,12 @@ int RPCServer(int intArg, void *ptrArg) {
                     }
                 }
 
+                //Remove file patches
+                if (a->patchFiles) {
+                    a->MEMFreeToDefaultHeap(a->patchFiles);
+                    a->patchFiles = 0;
+                }
+
                 //Make sure we're not stuck in an exception when the
                 //debugger disconnects without handling it
                 if (a->crashState == CRASH_STATE_BREAKPOINT) {
@@ -663,7 +809,12 @@ int RPCServer(int intArg, void *ptrArg) {
                 }
 
                 sendall(client, &count, 4);
-                sendall(client, messages, count * 0x10);
+                for (int i = 0; i < count; i++) {
+                    sendall(client, &messages[i], sizeof(OSMessage));
+                    if (messages[i].data0) {
+                        sendall(client, (void *)messages[i].data0, messages[i].data1);
+                    }
+                }
             }
 
             else if (cmd == 8) { //Get stack trace
@@ -771,7 +922,7 @@ int RPCServer(int intArg, void *ptrArg) {
                 }
             }
 
-            else if (cmd == 13) {
+            else if (cmd == 13) { //Get module name
                 char name[100] = {0};
                 int length = 100;
                 a->OSDynLoad_GetModuleName(-1, name, &length);
@@ -779,6 +930,29 @@ int RPCServer(int intArg, void *ptrArg) {
                 length = strlen(name);
                 sendall(client, &length, 4);
                 sendall(client, name, length);
+            }
+
+            else if (cmd == 14) { //Set patch files
+                if (a->patchFiles) {
+                    a->MEMFreeToDefaultHeap(a->patchFiles);
+                }
+
+                u32 length = recvword(client);
+                a->patchFiles = (char *)a->MEMAllocFromDefaultHeapEx(length, 4);
+                recvall(client, a->patchFiles, length);
+            }
+
+            else if (cmd == 15) { //Send file message
+                OSMessage message;
+                recvall(client, &message, sizeof(OSMessage));
+                a->OSSendMessage(&a->fileQueue, &message, OS_MESSAGE_BLOCK);
+            }
+
+            else if (cmd == 16) { //Clear patch files
+                if (a->patchFiles) {
+                    a->MEMFreeToDefaultHeap(a->patchFiles);
+                    a->patchFiles = 0;
+                }
             }
         }
 
@@ -916,6 +1090,7 @@ int _main(int argc, char *argv[]) {
 
 	a.OSInitMessageQueue(&a.serverQueue, a.serverMessages, MESSAGE_COUNT);
 	a.OSInitMessageQueue(&a.clientQueue, a.clientMessages, MESSAGE_COUNT);
+	a.OSInitMessageQueue(&a.fileQueue, &a.fileMessage, 1);
 	a.OSCreateThread(
 		&a.thread,
 		RPCServer,
